@@ -1,0 +1,9 @@
+# Run every optional ShellCheck check...
+enable=all
+
+# ...except a few opinionated style rules we deliberately don't adopt:
+#   SC2250 — require {braces} on every variable reference
+#   SC2292 — prefer [[ ]] over [ ] (portable [ ] tests are intentional here)
+#   SC2312 — "invoke separately to avoid masking return" for $() used in conditions
+#   SC2249 — require a default case in every case statement
+disable=SC2250,SC2292,SC2312,SC2249

@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+#
+# sync-exif — apply camera metadata from XMP/XML sidecars to scanned negatives,
+# while preserving the scanner's own metadata as secondary EXIF.
+#
+# Run with --help for usage, or see the README for the full description.
+# Requires: bash 4+, exiftool.
+
+set -uo pipefail
+# Note: `set -e` is deliberately omitted. This script relies on background jobs,
+# arithmetic that legitimately evaluates to 0, and `test && cmd` idioms, all of
+# which interact badly with errexit. Errors are handled explicitly instead.
+
+readonly PROG="sync-exif"
+readonly VERSION="0.1.0"
+
+# ── Output helpers ────────────────────────────────────────────────────────────
+err()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die()  { err "$1"; exit "${2:-1}"; }
+log()  { [ "${QUIET:-0}" -eq 1 ] || printf '%s\n' "$*"; }
+note() { printf '%s\n' "$*"; }
+
+# Fail early and clearly on shells without associative arrays (bash < 4). This
+# runs before any bash-4-only syntax is executed.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  printf '%s: requires bash 4.0 or newer (found %s). On macOS: brew install bash\n' \
+    "$PROG" "${BASH_VERSION:-unknown}" >&2
+  exit 1
+fi
+
+# ── Configuration (set by parse_args) ─────────────────────────────────────────
+DRY_RUN=0
+POSITIVES_ONLY=0
+QUIET=0
+DELETE_XMP=1
+JOBS=4
+FOLDER=""
+EXIFTOOL=""
+
+# ── Runtime state (populated as the run proceeds) ─────────────────────────────
+declare -a images=()        # all TIFF/NEF images found in FOLDER
+declare -A renamed_for=()   # image path → sidecar renamed to match it
+declare -a work_tif=()      # images that have a sidecar (the sync work list)
+declare -a work_sidecar=()  # sidecar path for each work_tif entry
+declare -a descs=()         # "image ← sidecar" display strings
+declare -a state=()         # per work item: 0 pending, 1 running, 2 ok, 3 failed
+declare -a pid_of=()        # per work item: background PID
+declare -a failed_idx=()    # work indices that failed
+readonly SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+readonly BAR_W=20
+
+synced=0; skipped=0; failed=0; deleted=0
+frame=0; next=0; running=0; finished=0; ui_lines=0
+total=0; LIST_CAP=0; USE_UI=0
+t_start=0; render_now=0; elapsed_us=0
+tmpd=""
+
+# ── Usage / version ───────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+$PROG $VERSION — apply camera metadata from XMP/XML sidecars to scanned negatives.
+
+Usage:
+  $PROG [options] [folder]
+
+  folder            Folder of TIFF/NEF images + sidecars (default: current dir)
+
+For each TIFF/NEF it renames numeric sidecars to match the image, copies the
+camera metadata from the sidecar into real EXIF (make, model, exposure, lens,
+GPS, DateTimeOriginal), records the scanner as secondary data (model in
+EXIF:Software, scan date in CreateDate/ModifyDate, scan settings kept), strips
+any embedded XMP, then deletes the sidecar on success.
+
+Files are processed in parallel. On a terminal a live list shows a spinner on
+in-flight files, ✓/✗ as they finish, and a fill bar.
+
+Options:
+  -j, --jobs N      Process N files concurrently (default 4)
+  -n, --dry-run     Show what would happen without modifying any files
+      --keep-xmp    Do not delete sidecars after a successful sync
+      --positives   Only run if the folder is named "Positives"
+  -q, --quiet       Only print the final summary
+  -V, --version     Print version and exit
+  -h, --help        Show this help
+EOF
+}
+
+version() { printf '%s %s\n' "$PROG" "$VERSION"; }
+
+# ── Small utilities ───────────────────────────────────────────────────────────
+now_us() {
+  # Current time in microseconds. Prefers bash 5's EPOCHREALTIME; falls back to
+  # whole-second precision on bash 4.
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    printf '%s' "${EPOCHREALTIME//[!0-9]/}"
+  else
+    printf '%s000000' "$(date +%s)"
+  fi
+}
+
+fmt_elapsed() {
+  # $1 = microseconds → "mm:ss".
+  local us="${1:-0}" s
+  s=$(( us / 1000000 ))
+  printf '%02d:%02d' "$(( s / 60 ))" "$(( s % 60 ))"
+}
+
+find_exiftool() {
+  # Print the path to a usable exiftool, or return 1.
+  local p
+  for p in /opt/homebrew/bin/exiftool /usr/local/bin/exiftool "$(command -v exiftool 2>/dev/null)"; do
+    if [ -n "$p" ] && [ -x "$p" ]; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_sidecar() {
+  # Print the matching sidecar path for an image basename ($1), or nothing.
+  # Case-insensitive via explicit ranges (nullglob drops non-matches); the "$b"
+  # prefix is quoted, so any glob metacharacters in the name stay literal.
+  local b="$1" cand
+  for cand in "$b".[xX][mM][pP] "$b".[xX][mM][lL]; do
+    [ -f "$cand" ] && { printf '%s' "$cand"; return 0; }
+  done
+  return 1
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+parse_args() {
+  local -a operands=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--dry-run)   DRY_RUN=1 ;;
+      --keep-xmp)     DELETE_XMP=0 ;;
+      --positives)    POSITIVES_ONLY=1 ;;
+      -q|--quiet)     QUIET=1 ;;
+      -j|--jobs)      shift; JOBS="${1:-}" ;;
+      --jobs=*)       JOBS="${1#*=}" ;;
+      -j*)            JOBS="${1#-j}" ;;
+      -V|--version)   version; exit 0 ;;
+      -h|--help)      usage; exit 0 ;;
+      --)             shift; operands+=("$@"); break ;;
+      -*)             die "unknown option: $1" 2 ;;
+      *)              operands+=("$1") ;;
+    esac
+    shift
+  done
+
+  if [ "${#operands[@]}" -gt 1 ]; then
+    die "too many arguments; expected at most one folder (got ${#operands[@]})" 2
+  fi
+  FOLDER="${operands[0]:-$PWD}"
+
+  if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || [ "$JOBS" -lt 1 ]; then
+    die "--jobs must be a positive integer (got '$JOBS')" 2
+  fi
+}
+
+# ── Image collection ──────────────────────────────────────────────────────────
+collect_images() {
+  shopt -s nocaseglob
+  images=( "$FOLDER"/*.tif "$FOLDER"/*.tiff "$FOLDER"/*.nef )
+  shopt -u nocaseglob
+  if [ "${#images[@]}" -eq 0 ]; then
+    note "$PROG: no TIFF/NEF files found in $FOLDER"
+    exit 0
+  fi
+}
+
+# ── Phase 1: rename numeric sidecars (01.xmp → <image basename>.xmp) ──────────
+rename_sidecars() {
+  # Map frame number → image path. The frame number is the digits in the image
+  # name matching the pattern _<digits>-, compared by numeric value (leading
+  # zeros ignored). Note: the regex takes the FIRST _<digits>- run, so names with
+  # several such segments (e.g. scan_5-and_10-final) resolve to the first (5).
+  local img base num sidecar sbase name ext newpath
+  declare -A img_by_num=() num_seen=()
+  for img in "${images[@]}"; do
+    base="${img##*/}"; base="${base%.*}"
+    if [[ "$base" =~ _([0-9]+)- ]]; then
+      num=$(( 10#${BASH_REMATCH[1]} ))
+      num_seen[num]=$(( ${num_seen[num]:-0} + 1 ))
+      img_by_num[num]="$img"
+    fi
+  done
+
+  shopt -s nocaseglob
+  for sidecar in "$FOLDER"/*.xmp "$FOLDER"/*.xml; do
+    sbase="${sidecar##*/}"
+    name="${sbase%.*}"
+    ext="${sbase##*.}"
+    [[ "$name" =~ ^[0-9]+$ ]] || continue
+    num=$(( 10#$name ))
+
+    # Refuse to guess when several images share this frame number.
+    if [ "${num_seen[num]:-0}" -gt 1 ]; then
+      log "  skip    $sbase  (frame $num matches multiple images; rename manually)"
+      continue
+    fi
+
+    img="${img_by_num[num]:-}"
+    [ -n "$img" ] || continue
+    newpath="${img%.*}.$ext"
+    if [ "$sidecar" != "$newpath" ]; then
+      # Never clobber an already-correctly-named sidecar; leave both in place and
+      # let the existing one be used, rather than destroying it.
+      if [ -e "$newpath" ]; then
+        log "  skip    $sbase  (target ${newpath##*/} already exists)"
+        continue
+      fi
+      log "  rename  $sbase → ${newpath##*/}"
+      [ "$DRY_RUN" -eq 1 ] || mv -- "$sidecar" "$newpath"
+    fi
+    renamed_for[$img]="$newpath"
+  done
+  shopt -u nocaseglob
+}
+
+# ── Build the work list (skips images without a sidecar) ──────────────────────
+build_worklist() {
+  local img leaf sidecar
+  for img in "${images[@]}"; do
+    leaf="${img##*/}"
+    sidecar="${renamed_for[$img]:-}"
+    [ -z "$sidecar" ] && sidecar="$(find_sidecar "${img%.*}")"
+    if [ -z "$sidecar" ]; then
+      log "  skip    $leaf  (no sidecar)"
+      skipped=$(( skipped + 1 ))
+    else
+      work_tif+=("$img")
+      work_sidecar+=("$sidecar")
+      descs+=("$(printf '%-16s ← %-16s' "$leaf" "${sidecar##*/}")")
+    fi
+  done
+}
+
+# ── Sync one file ─────────────────────────────────────────────────────────────
+sync_one() {
+  # $1 = work index. In one exiftool call, copy the camera metadata from the
+  # sidecar into real EXIF and record the scanner as secondary data — the
+  # scanner model (original IFD0:Model) → EXIF:Software and the scan date
+  # (original IFD0:ModifyDate) → CreateDate, keeping IFD0:ModifyDate — then strip
+  # any embedded XMP. stderr → per-file log; the return code drives the sentinel.
+  local i="$1"
+  local tif="${work_tif[i]}" sidecar="${work_sidecar[i]}"
+
+  # Guard: the sidecar must actually carry camera metadata that maps into EXIF.
+  # Without this a sidecar that yields nothing (e.g. a non-XMP .xml, or an XMP
+  # with no mappable tags) would still "succeed" — exiftool always sets Software
+  # and strips XMP — and then be deleted, losing its camera data forever.
+  local have
+  have="$("$EXIFTOOL" -s3 -f -XMP-tiff:Make -XMP-tiff:Model -XMP-exif:DateTimeOriginal \
+    "$sidecar" 2>/dev/null | tr -d '\n-')"
+  if [ -z "$have" ]; then
+    printf 'no mappable camera metadata in sidecar %s\n' "${sidecar##*/}" >"$tmpd/$i.err"
+    return 1
+  fi
+
+  "$EXIFTOOL" \
+    -tagsfromfile "$sidecar" '-EXIF:all<XMP:all' '-GPS:all<XMP:all' \
+    -tagsfromfile @ '-EXIF:Software<IFD0:Model' \
+                    '-EXIF:CreateDate<IFD0:ModifyDate' \
+                    '-IFD0:ModifyDate<IFD0:ModifyDate' \
+    -XMP:all= -overwrite_original "$tif" >/dev/null 2>"$tmpd/$i.err"
+}
+
+# run_worker <index> — background wrapper that GUARANTEES a result sentinel via
+# an EXIT trap, so the reap loop can never wait forever on a worker that aborts.
+run_worker() {
+  local idx="$1" rc=1
+  trap 'echo "$rc" >"$tmpd/$idx.rc"' EXIT
+  sync_one "$idx"
+  rc=$?
+}
+
+# ── Live terminal UI ──────────────────────────────────────────────────────────
+init_ui() {
+  local idx rows=0
+  for idx in "${!work_tif[@]}"; do state[idx]=0; done
+  if [ "$USE_UI" -eq 1 ]; then
+    # stty reports the live window size; tput lines can be a stale terminfo value.
+    rows="$(stty size 2>/dev/null </dev/tty | awk '{print $1}')"
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows="$(tput lines 2>/dev/null)"
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows=0
+  fi
+  LIST_CAP=0
+  [ "$rows" -gt 3 ] && LIST_CAP=$(( rows - 2 ))   # reserve the bar + one spare row
+}
+
+render() {
+  local i s filled bar='' j lines=0 start=0 shown="$total" f now
+  [ "$ui_lines" -gt 0 ] && printf '\033[%dA\033[J' "$ui_lines"
+  # If the list is taller than the viewport, show a window centred on the
+  # frontier (first file not yet finished) so active work stays visible.
+  if [ "$LIST_CAP" -gt 0 ] && [ "$total" -gt "$LIST_CAP" ]; then
+    shown="$LIST_CAP"
+    f=0
+    while [ "$f" -lt "$total" ] && { [ "${state[f]}" -eq 2 ] || [ "${state[f]}" -eq 3 ]; }; do
+      f=$(( f + 1 ))
+    done
+    start=$(( f > shown / 2 ? f - shown / 2 : 0 ))
+    [ $(( start + shown )) -gt "$total" ] && start=$(( total - shown ))
+  fi
+  for (( i = start; i < start + shown; i++ )); do
+    case "${state[i]}" in
+      0) s=' ' ;;                    # pending: blank, just listed
+      1) s="${SPIN[frame]}" ;;
+      2) s='✓' ;;
+      3) s='✗' ;;
+    esac
+    printf '  %s %s\n' "$s" "${descs[i]}"
+    lines=$(( lines + 1 ))
+  done
+  filled=$(( finished * BAR_W / total ))
+  for (( j = 0; j < BAR_W; j++ )); do
+    [ "$j" -lt "$filled" ] && bar+='#' || bar+='-'
+  done
+  now="${render_now:-$(now_us)}"
+  printf '[%s] %d/%d done%s  ·  %s\n' "$bar" "$finished" "$total" \
+    "$( [ "$failed" -gt 0 ] && printf '  (%d failed)' "$failed" )" \
+    "$(fmt_elapsed "$(( now - t_start ))")"
+  ui_lines=$(( lines + 1 ))
+}
+
+# ── Phase 2: run the sync in parallel ─────────────────────────────────────────
+# Files are independent (each exiftool call writes its own uniquely named temp
+# file in place), so up to JOBS run concurrently.
+reap_one() {
+  # Mark work item $1 finished with return code $2, updating counters/state and
+  # streaming a completion line when the live UI is off.
+  local i="$1" rc="$2"
+  wait "${pid_of[i]}" 2>/dev/null || true   # reap zombie; rc already determined
+  running=$(( running - 1 ))
+  finished=$(( finished + 1 ))
+  if [ "$rc" -eq 0 ]; then
+    state[i]=2
+    synced=$(( synced + 1 ))
+  else
+    state[i]=3
+    failed=$(( failed + 1 ))
+    failed_idx+=("$i")
+  fi
+  if [ "$USE_UI" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+    if [ "$rc" -eq 0 ]; then
+      note "  ✓ [$finished/$total] ${descs[i]}"
+    else
+      note "  ✗ [$finished/$total] ${descs[i]}  FAILED"
+    fi
+  fi
+}
+
+run_all() {
+  local i
+  t_start="$(now_us)"
+  while [ "$finished" -lt "$total" ]; do
+    # Launch up to JOBS concurrent files.
+    while [ "$running" -lt "$JOBS" ] && [ "$next" -lt "$total" ]; do
+      run_worker "$next" &
+      pid_of[next]=$!
+      state[next]=1
+      running=$(( running + 1 ))
+      next=$(( next + 1 ))
+    done
+
+    if [ "$USE_UI" -eq 1 ]; then
+      render
+      frame=$(( (frame + 1) % ${#SPIN[@]} ))
+    fi
+    sleep 0.12
+
+    # Reap finished workers. A running worker is done when its .rc sentinel
+    # appears; if instead its process has vanished without one (e.g. killed), we
+    # record a failure rather than looping forever.
+    for i in "${!work_tif[@]}"; do
+      [ "${state[i]}" -eq 1 ] || continue
+      if [ -s "$tmpd/$i.rc" ]; then
+        reap_one "$i" "$(<"$tmpd/$i.rc")"
+      elif ! kill -0 "${pid_of[i]}" 2>/dev/null; then
+        printf 'worker terminated unexpectedly (no result written)\n' >"$tmpd/$i.err"
+        reap_one "$i" 1
+      fi
+    done
+  done
+  render_now="$(now_us)"
+  elapsed_us=$(( render_now - t_start ))
+  [ "$USE_UI" -eq 1 ] && render   # final repaint: every ✓/✗ shows, timer frozen
+}
+
+# ── Reporting ─────────────────────────────────────────────────────────────────
+print_plan() {
+  local n=0 idx
+  for idx in "${!work_tif[@]}"; do
+    n=$(( n + 1 ))
+    log "$(printf '  [%*d/%d] %s' "${#total}" "$n" "$total" "${descs[idx]}")"
+  done
+  note "Done: $total would sync, $skipped skipped.  [dry run]"
+  [ "$DELETE_XMP" -eq 1 ] && note "(sidecars of synced files would then be deleted)"
+}
+
+delete_sidecars() {
+  [ "$DELETE_XMP" -eq 1 ] || return 0
+  local i
+  for i in "${!work_tif[@]}"; do
+    if [ "${state[i]}" -eq 2 ]; then
+      rm -f -- "${work_sidecar[i]}" && deleted=$(( deleted + 1 ))
+    fi
+  done
+}
+
+print_summary() {
+  note "Done: $synced synced, $skipped skipped, $failed failed  ·  $(fmt_elapsed "$elapsed_us")"
+  [ "$DELETE_XMP" -eq 1 ] && note "Deleted $deleted sidecar file(s)."
+  if [ "${#failed_idx[@]}" -gt 0 ]; then
+    note ""
+    note "Errored:"
+    local i
+    for i in "${failed_idx[@]}"; do
+      note "  ${descs[i]}"
+      grep -iE 'error|warning' "$tmpd/$i.err" 2>/dev/null | grep -vi '\[minor\]' | sed 's/^/    /'
+    done
+  fi
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+  shopt -s nullglob   # empty globs expand to nothing (image + sidecar lookups)
+
+  EXIFTOOL="$(find_exiftool)" \
+    || die "exiftool not found. Install with: brew install exiftool"
+  [ -d "$FOLDER" ] || die "not a directory: $FOLDER"
+  FOLDER="$(cd "$FOLDER" && pwd)" || die "cannot access directory: $FOLDER"
+
+  if [ "$POSITIVES_ONLY" -eq 1 ] && [ "$(basename "$FOLDER")" != "Positives" ]; then
+    err "folder is not named 'Positives' (--positives set); nothing to do."
+    exit 0
+  fi
+
+  collect_images
+  log "$PROG: $FOLDER"
+  log "Found ${#images[@]} image file(s).$( [ "$DRY_RUN" -eq 1 ] && printf '  [dry run]' )"
+
+  rename_sidecars
+  build_worklist
+
+  total="${#work_tif[@]}"
+  [ "$JOBS" -gt "$total" ] && [ "$total" -gt 0 ] && JOBS="$total"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    print_plan
+    exit 0
+  fi
+  if [ "$total" -eq 0 ]; then
+    note "Done: 0 synced, $skipped skipped, 0 failed."
+    exit 0
+  fi
+
+  # Live UI only on an interactive terminal; pipes and --quiet stream plain lines.
+  [ -t 1 ] && [ "$QUIET" -eq 0 ] && USE_UI=1
+  log "$PROG: syncing $total file(s), up to $JOBS at a time"
+
+  tmpd="$(mktemp -d -t "$PROG")"
+  trap 'rm -rf "$tmpd"' EXIT
+
+  init_ui
+  run_all
+  delete_sidecars
+  print_summary
+
+  [ "$failed" -gt 0 ] && exit 1
+  exit 0
+}
+
+main "$@"
