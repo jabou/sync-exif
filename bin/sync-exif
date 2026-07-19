@@ -106,7 +106,12 @@ fmt_elapsed() {
 }
 
 find_exiftool() {
-  # Print the path to a usable exiftool, or return 1.
+  # Print the path to a usable exiftool, or return 1. An explicit override via
+  # SYNC_EXIF_EXIFTOOL wins (handy for unusual installs and for the test suite).
+  if [ -n "${SYNC_EXIF_EXIFTOOL:-}" ] && [ -x "${SYNC_EXIF_EXIFTOOL}" ]; then
+    printf '%s' "$SYNC_EXIF_EXIFTOOL"
+    return 0
+  fi
   local p
   for p in /opt/homebrew/bin/exiftool /usr/local/bin/exiftool "$(command -v exiftool 2>/dev/null)"; do
     if [ -n "$p" ] && [ -x "$p" ]; then
@@ -462,7 +467,9 @@ main() {
   [ -t 1 ] && [ "$QUIET" -eq 0 ] && USE_UI=1
   log "$PROG: syncing $total file(s), up to $JOBS at a time"
 
-  tmpd="$(mktemp -d -t "$PROG")"
+  # Portable template: GNU mktemp requires the X's and rejects a bare prefix,
+  # while BSD/macOS mktemp accepts this form too.
+  tmpd="$(mktemp -d "${TMPDIR:-/tmp}/$PROG.XXXXXX")" || die "could not create a temp directory"
   trap 'rm -rf "$tmpd"' EXIT
 
   init_ui
