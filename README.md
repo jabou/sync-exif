@@ -54,6 +54,13 @@ time order your photos by when they were *taken*, not when they were scanned.
 brew install jabou/tap/sync-exif
 ```
 
+Or tap first, then install by the short name:
+
+```sh
+brew tap jabou/tap
+brew install sync-exif
+```
+
 ### Manual
 
 ```sh
