@@ -8,7 +8,7 @@ Apply camera metadata from XMP/XML sidecars to scanned film negatives — while
 
 When you scan film, the scanner stamps the file with *its* identity (e.g.
 `Nikon COOLSCAN V ED`) and scan settings. But the metadata you actually care
-about — the camera, lens, aperture, shutter, ISO, film stock, GPS — lives in a
+about, the camera, lens, aperture, shutter, ISO, film stock, GPS, lives in a
 sidecar you produced separately. `sync-exif` merges the two so the **camera**
 becomes the primary EXIF (visible in every photo app) and the **scanner** is
 kept as a secondary record, all in a single file with no leftovers.
